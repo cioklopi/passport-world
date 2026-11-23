@@ -45,19 +45,156 @@ async function fetchArea(code, b, depth, key) {
   for (let i = 0; i < 4; i++) { const r = await fetchArea(code, subs[i], depth + 1, key + "_" + i); for (const x of r) out.push(x); await sleep(1500); }
   return out;
 }
+
+/* ---------- Map file mode: download an OpenStreetMap extract (.osm.pbf) and read only the city area.
+   This does not depend on the busy public Overpass servers. ---------- */
+const PBF_SOURCES = {
+  JFK: ["https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf", "https://download.bbbike.org/osm/bbbike/NewYork/NewYork.osm.pbf"]
+};
+function PB(b, p, e) { this.b = b; this.p = p || 0; this.e = e === undefined ? b.length : e; }
+PB.prototype.v = function () { const b = this.b; let r = 0, m = 1, c; do { c = b[this.p++]; r += (c & 127) * m; m *= 128; } while (c >= 128); return r; };
+PB.prototype.next = function () { if (this.p >= this.e) return false; const k = this.v(); this.f = Math.floor(k / 8); this.t = k & 7; return true; };
+PB.prototype.len = function () { const n = this.v(), s = this.p; this.p += n; return [s, this.p]; };
+PB.prototype.skip = function () { const t = this.t; if (t === 0) this.v(); else if (t === 1) this.p += 8; else if (t === 2) { const n = this.v(); this.p += n; } else if (t === 5) this.p += 4; else throw new Error("bad wire type"); };
+const zz = n => (n % 2 === 1 ? -(n + 1) / 2 : n / 2);
+const i64 = n => (n >= 9223372036854775807 ? n - 18446744073709551616 : n);
+function packed(b, r) { const pb = new PB(b, r[0], r[1]), out = []; while (pb.p < pb.e) out.push(pb.v()); return out; }
+function readPbf(file, box, onProgress) {
+  const fd = fs.openSync(file, "r"), size = fs.fstatSync(fd).size, N = new Map(), W = new Map(), R = [];
+  const hdr = Buffer.alloc(4); let pos = 0;
+  const rd = n => { const b = Buffer.alloc(n); let got = 0; while (got < n) { const k = fs.readSync(fd, b, got, n - got, pos + got); if (!k) throw new Error("map file is cut short"); got += k; } pos += n; return b; };
+  try {
+    while (pos < size) {
+      fs.readSync(fd, hdr, 0, 4, pos); pos += 4;
+      const hb = rd(hdr.readUInt32BE(0)), h = new PB(hb); let type = "", dsz = 0;
+      while (h.next()) { if (h.f === 1) { const r = h.len(); type = hb.toString("utf8", r[0], r[1]); } else if (h.f === 3) dsz = h.v(); else h.skip(); }
+      const blob = rd(dsz);
+      if (type !== "OSMData") continue;
+      const bp = new PB(blob); let data = null;
+      while (bp.next()) { if (bp.f === 1) { const r = bp.len(); data = blob.subarray(r[0], r[1]); } else if (bp.f === 3) { const r = bp.len(); data = zlib.inflateSync(blob.subarray(r[0], r[1])); } else if (bp.f === 4 || bp.f === 7) throw new Error("unsupported map compression"); else bp.skip(); }
+      if (data) block(data);
+      if (onProgress) onProgress(pos / size);
+    }
+  } finally { fs.closeSync(fd); }
+  function block(b) {
+    const pb = new PB(b), groups = []; let st = null, gran = 100, lato = 0, lono = 0;
+    while (pb.next()) {
+      if (pb.f === 1) st = pb.len(); else if (pb.f === 2) groups.push(pb.len());
+      else if (pb.f === 17) gran = pb.v(); else if (pb.f === 19) lato = i64(pb.v()); else if (pb.f === 20) lono = i64(pb.v()); else pb.skip();
+    }
+    let strs = null;
+    const S = i => { if (!strs) { strs = []; const sp = new PB(b, st[0], st[1]); while (sp.next()) { if (sp.f === 1) { const r = sp.len(); strs.push(b.toString("utf8", r[0], r[1])); } else sp.skip(); } } return strs[i]; };
+    const tagsOf = (ks, vs) => { if (!ks.length) return undefined; const t = {}; for (let i = 0; i < ks.length; i++) t[S(ks[i])] = S(vs[i]); return t; };
+    for (const g of groups) {
+      const gp = new PB(b, g[0], g[1]);
+      while (gp.next()) {
+        const r = gp.t === 2 ? gp.len() : (gp.skip(), null); if (!r) continue;
+        if (gp.f === 2) dense(r); else if (gp.f === 1) node(r); else if (gp.f === 3) way(r); else if (gp.f === 4) rel(r);
+      }
+    }
+    function inBox(lat, lon) { return lat >= box.s && lat <= box.n && lon >= box.w && lon <= box.e; }
+    function dense(r) {
+      const p = new PB(b, r[0], r[1]); let ids, lats, lons, kv = null;
+      while (p.next()) { if (p.f === 1) ids = p.len(); else if (p.f === 8) lats = p.len(); else if (p.f === 9) lons = p.len(); else if (p.f === 10) kv = p.len(); else p.skip(); }
+      if (!ids) return;
+      const I = new PB(b, ids[0], ids[1]), A = new PB(b, lats[0], lats[1]), O = new PB(b, lons[0], lons[1]), K = kv ? new PB(b, kv[0], kv[1]) : null;
+      let id = 0, la = 0, lo = 0;
+      while (I.p < I.e) {
+        id += zz(I.v()); la += zz(A.v()); lo += zz(O.v());
+        const lat = 1e-9 * (lato + gran * la), lon = 1e-9 * (lono + gran * lo), keep = inBox(lat, lon);
+        let tags;
+        if (K && K.p < K.e) { for (;;) { const k = K.v(); if (k === 0) break; const v = K.v(); if (keep) { (tags || (tags = {}))[S(k)] = S(v); } } }
+        if (keep) N.set(id, { type: "node", id, lat, lon, tags });
+      }
+    }
+    function node(r) {
+      const p = new PB(b, r[0], r[1]); let id = 0, la = 0, lo = 0, ks = [], vs = [];
+      while (p.next()) { if (p.f === 1) id = zz(p.v()); else if (p.f === 2) ks = packed(b, p.len()); else if (p.f === 3) vs = packed(b, p.len()); else if (p.f === 8) la = zz(p.v()); else if (p.f === 9) lo = zz(p.v()); else p.skip(); }
+      const lat = 1e-9 * (lato + gran * la), lon = 1e-9 * (lono + gran * lo);
+      if (inBox(lat, lon)) N.set(id, { type: "node", id, lat, lon, tags: tagsOf(ks, vs) });
+    }
+    function way(r) {
+      const p = new PB(b, r[0], r[1]); let id = 0, ks = [], vs = [], refs = null;
+      while (p.next()) { if (p.f === 1) id = p.v(); else if (p.f === 2) ks = packed(b, p.len()); else if (p.f === 3) vs = packed(b, p.len()); else if (p.f === 8) refs = p.len(); else p.skip(); }
+      if (!refs) return;
+      const rp = new PB(b, refs[0], refs[1]), nodes = []; let ref = 0, hit = false;
+      while (rp.p < rp.e) { ref += zz(rp.v()); nodes.push(ref); if (!hit && N.has(ref)) hit = true; }
+      if (hit) W.set(id, { type: "way", id, nodes, tags: tagsOf(ks, vs) });
+    }
+    function rel(r) {
+      const p = new PB(b, r[0], r[1]); let id = 0, ks = [], vs = [], roles = [], mids = null, types = [];
+      while (p.next()) { if (p.f === 1) id = p.v(); else if (p.f === 2) ks = packed(b, p.len()); else if (p.f === 3) vs = packed(b, p.len()); else if (p.f === 8) roles = packed(b, p.len()); else if (p.f === 9) mids = p.len(); else if (p.f === 10) types = packed(b, p.len()); else p.skip(); }
+      if (!mids || !ks.length) return;
+      const mp = new PB(b, mids[0], mids[1]), members = []; let ref = 0, hit = false, i = 0;
+      while (mp.p < mp.e) { ref += zz(mp.v()); const t = types[i] === 0 ? "node" : types[i] === 1 ? "way" : "relation"; members.push({ type: t, ref, role: S(roles[i]) || "" }); if (!hit && ((t === "way" && W.has(ref)) || (t === "node" && N.has(ref)))) hit = true; i++; }
+      if (hit) R.push({ type: "relation", id, members, tags: tagsOf(ks, vs) });
+    }
+  }
+  const out = []; for (const n of N.values()) out.push(n); for (const w of W.values()) out.push(w); for (const r of R) out.push(r);
+  return out;
+}
+async function download(url, file, onProgress) {
+  const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 45 * 60000);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, headers: { "User-Agent": "EarthPass/1.0 (game map builder)" } });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const total = +r.headers.get("content-length") || 0, ws = fs.createWriteStream(file); let got = 0, last = 0;
+    for await (const chunk of r.body) {
+      got += chunk.length;
+      if (!ws.write(chunk)) await new Promise(res => ws.once("drain", res));
+      if (total && Date.now() - last > 2000) { last = Date.now(); onProgress(got / total); }
+    }
+    await new Promise((res, rej) => ws.end(err => err ? rej(err) : res()));
+    const head = Buffer.alloc(16), fd = fs.openSync(file, "r"); fs.readSync(fd, head, 0, 16, 0); fs.closeSync(fd);
+    if (!head.includes("OSMHeader")) throw new Error("not a map file");
+    console.log("downloaded", url, Math.round(got / 1048576) + " MB");
+  } finally { clearTimeout(tm); }
+}
+async function elementsFromPbf(code, c, job) {
+  const list = (c.pbf ? [].concat(c.pbf) : []).concat(PBF_SOURCES[code] || []);
+  if (!list.length) return null;
+  const kx = Math.cos(c.lat * Math.PI / 180) * 111320, kz = 110540, R = HALF + 400;
+  const box = { w: c.lon - R / kx, e: c.lon + R / kx, s: c.lat - R / kz, n: c.lat + R / kz };
+  const dl = path.join(CACHE, "_download"); fs.mkdirSync(dl, { recursive: true });
+  const file = path.join(dl, code + ".osm.pbf");
+  for (const url of list) {
+    try {
+      if (!fs.existsSync(file + ".ok")) {
+        console.log(code, "downloading map file", url);
+        await download(url, file, f => { job.progress = f * 0.6; });
+        fs.writeFileSync(file + ".ok", url);
+      }
+      console.log(code, "reading map file");
+      const els = readPbf(file, box, f => { job.progress = 0.6 + f * 0.32; });
+      console.log(code, "map file elements", els.length);
+      if (els.length < 100) throw new Error("city area not found in map file");
+      fs.rmSync(file, { force: true }); fs.rmSync(file + ".ok", { force: true });
+      return els;
+    } catch (e) {
+      console.log(code, "map file failed", url, e.message);
+      fs.rmSync(file, { force: true }); fs.rmSync(file + ".ok", { force: true });
+    }
+  }
+  return null;
+}
 async function buildCity(code) {
   const c = CITIES[code]; if (!c) throw new Error("unknown city " + code);
   const job = jobs[code] = { progress: 0, started: Date.now() };
-  const kx = Math.cos(c.lat * Math.PI / 180) * 111320, kz = 110540, step = (HALF * 2) / BLOCKS, pad = 60;
-  const seen = new Set(), elements = [];
-  for (let i = 0; i < BLOCKS; i++) for (let j = 0; j < BLOCKS; j++) {
-    const x1 = -HALF + i * step - pad, x2 = -HALF + (i + 1) * step + pad, z1 = -HALF + j * step - pad, z2 = -HALF + (j + 1) * step + pad;
-    const b = { w: c.lon + x1 / kx, e: c.lon + x2 / kx, n: c.lat - z1 / kz, s: c.lat - z2 / kz };
-    const els = await fetchArea(code, b, 0, "b" + i + j);
-    for (const el of els) { const k = el.type[0] + el.id; if (!seen.has(k)) { seen.add(k); elements.push(el); } }
-    job.progress = (i * BLOCKS + j + 1) / (BLOCKS * BLOCKS) * 0.92;
-    console.log(code, "block", i, j, "elements", elements.length);
-    await sleep(1500);
+  let elements = await elementsFromPbf(code, c, job);
+  if (!elements) {
+    console.log(code, "using Overpass servers");
+    elements = [];
+    const kx = Math.cos(c.lat * Math.PI / 180) * 111320, kz = 110540, step = (HALF * 2) / BLOCKS, pad = 60;
+    const seen = new Set();
+    for (let i = 0; i < BLOCKS; i++) for (let j = 0; j < BLOCKS; j++) {
+      const x1 = -HALF + i * step - pad, x2 = -HALF + (i + 1) * step + pad, z1 = -HALF + j * step - pad, z2 = -HALF + (j + 1) * step + pad;
+      const b = { w: c.lon + x1 / kx, e: c.lon + x2 / kx, n: c.lat - z1 / kz, s: c.lat - z2 / kz };
+      const els = await fetchArea(code, b, 0, "b" + i + j);
+      for (const el of els) { const k = el.type[0] + el.id; if (!seen.has(k)) { seen.add(k); elements.push(el); } }
+      job.progress = (i * BLOCKS + j + 1) / (BLOCKS * BLOCKS) * 0.92;
+      console.log(code, "block", i, j, "elements", elements.length);
+      await sleep(1500);
+    }
   }
   const res = convert(elements, { lat: c.lat, lon: c.lon, half: HALF, tile: 250 });
   const tmp = path.join(CACHE, code + ".tmp"); fs.rmSync(tmp, { recursive: true, force: true }); fs.mkdirSync(tmp, { recursive: true });
